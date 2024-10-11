@@ -1,16 +1,18 @@
-USE [DBAdmin]
+SET ANSI_NULLS ON;
+GO
+
+SET QUOTED_IDENTIFIER OFF;
 GO
 
 
-SET ANSI_NULLS ON
-GO
 
-SET QUOTED_IDENTIFIER OFF
-GO
-
-
-CREATE OR ALTER procedure [dbo].[ActiveSpids]  @SortCriteria VarChar(50) = Null, @IncludeBlocking Bit = 1, @ShowPlan bit = 0, @Fast bit = 0
-as
+CREATE OR ALTER PROCEDURE dbo.ActiveSpids
+    @SortCriteria VARCHAR(50) = NULL,
+    @IncludeBlocking BIT = 1,
+    @ShowPlan BIT = 0,
+    @Fast BIT = 0,
+    @IncludeSleepers BIT = 1
+AS
 /**************************************************************************************************************************************************************************************
 *   DBAdmin.dbo.ActiveSpids 
 *   Creator:       DBA Team
@@ -50,213 +52,275 @@ as
 *                                Changed join from cross to outer apply to sys.dm_exec_query_plan to not filter out "alter index". Was leaving out queries
 *                                that did not have a query plan.
 *  Dan Shargel      01/23/2018  Filter out SP_SERVER_DIAGNOSTICS_SLEEP 
+*  Dan Shargel      07/19/2023  Add option to include idle sessions with open transactions @IncludeSleepers
 **************************************************************************************************************************************************************************************/
 
 ---------------------------------------------
 -- declare variables
 ---------------------------------------------
-declare @SQL varchar(4000), @ErrMsg VarChar(150)
+DECLARE @SQL VARCHAR(4000),
+        @ErrMsg VARCHAR(150);
 
 ---------------------------------------------
 -- set session variables
 ---------------------------------------------
-set nocount on
+SET NOCOUNT ON;
 
 ---------------------------------------------
 -- body of stored procedure
 ---------------------------------------------
-If @SortCriteria Is Null
-	Set @SortCriteria = 'start_time'
+IF @SortCriteria IS NULL
+    SET @SortCriteria = 'start_time';
 
-If @IncludeBlocking Is Null
-	Set @IncludeBlocking = 1
+IF @IncludeBlocking IS NULL
+    SET @IncludeBlocking = 1;
 
 
 --Ensure appropriate parameters are being passed:
-If @SortCriteria Not In ('SPID', 'session_id', 'start_time', 'BatchStartTime','TranStartTime')
-Begin
-Set @ErrMsg = 'Only the following are acceptable for @SortCriteria: ' + Char(13) + Char(10)
-Set @ErrMsg = @ErrMsg + 'SPID, session_id, start_time, BatchStartTime'
-GoTo QuitWithError
-End
+IF @SortCriteria NOT IN ( 'SPID', 'session_id', 'start_time', 'BatchStartTime', 'TranStartTime' )
+BEGIN
+    SET @ErrMsg = 'Only the following are acceptable for @SortCriteria: ' + CHAR(13) + CHAR(10);
+    SET @ErrMsg = @ErrMsg + 'SPID, session_id, start_time, BatchStartTime';
+    GOTO QuitWithError;
+END;
 
 -----------------------------------------------------------------------------------------------------------
 -- If blocking from schema lock or more than 5 spids blocked, use lighter-weight query to avoid being 
 -- blocked.  Occasionally this query will hang when blocking occurs, haven't been able to reproduce it
 -- so attempting to work around it.
 -----------------------------------------------------------------------------------------------------------
-if exists(
-	Select  1 from sys.dm_exec_requests where blocking_session_id <> 0 and wait_type = 'LCK_M_SCH_S')
-	or (select count(*)  from sys.dm_exec_requests where blocking_session_id <> 0) > 5
-set @Fast = 1
+IF EXISTS
+(
+    SELECT 1
+    FROM sys.dm_exec_requests
+    WHERE blocking_session_id <> 0
+          AND wait_type = 'LCK_M_SCH_S'
+)
+   OR
+   (
+       SELECT COUNT(*)FROM sys.dm_exec_requests WHERE blocking_session_id <> 0
+   ) > 5
+    SET @Fast = 1;
 
 
-if @Fast = 0
-begin
-Select * From
-	(Select
-		R.session_id as [SPID]
-		, R.start_time as BatchStartTime
-		, datediff(ss, R.start_time, getDate())/60 as BatchMin
-		, T.transaction_begin_time as TranStartTime
-		, datediff(ss, T.transaction_begin_time, getDate())/60 as TranMin
-		, S.login_name as [Login]
-		, S.host_name as [Host]
-		, R.Blocking_session_id as blocker
-		, db_name(r.database_id) as dbName
-		, object_schema_name (qt.objectid,qt.[dbid]) as schm
-		, object_name(qt.objectid, qt.[dbid]) as procName
-		, ib.event_info  as InputBuffer
-		,(select top 1 SUBSTRING(qt.[text],statement_start_offset / 2+1 , 
-		  ( (case when statement_end_offset <= 0 
-			 then (LEN(CONVERT(nvarchar(max),qt.[text])) * 2) 
-			 else statement_end_offset end)  - statement_start_offset) / 2+1)) As statement_text
-		, R.wait_type
-		, R.status
-		, R.command
-		, R.cpu_time
-		, R.reads
-		, R.writes
-		, R.start_time
-		, S.last_request_start_time
-		, m.scheduler_id
-		, m.requested_memory_kb
-		, m.granted_memory_kb
-		, m.query_cost
-		,convert(varchar(50),'('+convert(varchar(5),wait_time)+'ms)')+wait_resource as wait_resource
-		, (R.estimated_completion_time/1000)/60.0 as ect_min
-	    , R.percent_complete
-		, R.open_transaction_count
-		, u.user_objects_alloc_page_count
-		, u.user_objects_dealloc_page_count
-		, u.internal_objects_alloc_page_count
-		, u.internal_objects_dealloc_page_count
-		, R.total_elapsed_time
-		, Case
-			When @SortCriteria In ('SPID', 'session_id') Then Cast(R.session_id As VarBinary(50))
-			When @SortCriteria In ('BatchStartTime', 'start_time') Then Cast(R.start_time As VarBinary(50))
-			When @SortCriteria In ('TranStartTime', 'Tran') Then Cast(IsNull(datediff(mi, T.transaction_begin_time, getDate()),0) As VarBinary(50))
-		End As SortCriteria
-		, Case 
-			when @ShowPlan = 1 then qp.Query_plan
-			when @ShowPlan = 0 then 'Query Plan Not Requested: @ShowPlan = 0'
-			end as QueryPlan
-		--, qp.Query_plan
-	from sys.dm_exec_requests R 
-	left outer join sys.dm_exec_sessions S
-		on R.Session_id = S.Session_id
-	left outer join sys.dm_tran_active_transactions t
-	on r.transaction_id = t.transaction_id
-	left outer join sys.dm_exec_query_memory_grants m
-	on S.Session_id = m.session_id
-	and R.request_id = m.request_id
-	left outer join sys.dm_db_session_space_usage u
-	on S.Session_id = u.session_id
+IF @Fast = 0
+BEGIN
+    SELECT *
+    FROM
+    (
+        SELECT R.session_id AS SPID,
+               R.start_time AS BatchStartTime,
+               DATEDIFF(ss, R.start_time, GETDATE()) / 60 AS BatchMin,
+               t.transaction_begin_time AS TranStartTime,
+               DATEDIFF(ss, t.transaction_begin_time, GETDATE()) / 60 AS TranMin,
+               S.login_name AS Login,
+               S.host_name AS Host,
+               R.Blocking_session_id AS blocker,
+               DB_NAME(R.database_id) AS dbName,
+               OBJECT_SCHEMA_NAME(qt.objectid, qt.dbid) AS schm,
+               OBJECT_NAME(qt.objectid, qt.dbid) AS procName,
+               ib.event_info AS InputBuffer,
+               (
+                   SELECT TOP 1
+                          SUBSTRING(   qt.text,
+                                       statement_start_offset / 2 + 1,
+                                       ((CASE
+                                             WHEN statement_end_offset <= 0 THEN
+                                       (LEN(CONVERT(NVARCHAR(MAX), qt.text)) * 2)
+                                             ELSE
+                                                 statement_end_offset
+                                         END
+                                        ) - statement_start_offset
+                                       ) / 2 + 1
+                                   )
+               ) AS statement_text,
+               R.wait_type,
+               R.status,
+               R.command,
+               R.cpu_time,
+               R.reads,
+               R.writes,
+               R.start_time,
+               S.last_request_start_time,
+               m.scheduler_id,
+               m.requested_memory_kb,
+               m.granted_memory_kb,
+               m.query_cost,
+               CONVERT(VARCHAR(50), '(' + CONVERT(VARCHAR(5), wait_time) + 'ms)') + wait_resource AS wait_resource,
+               (R.estimated_completion_time / 1000) / 60.0 AS ect_min,
+               R.percent_complete,
+               R.open_transaction_count,
+               u.user_objects_alloc_page_count,
+               u.user_objects_dealloc_page_count,
+               u.internal_objects_alloc_page_count,
+               u.internal_objects_dealloc_page_count,
+               R.total_elapsed_time,
+               CASE
+                   WHEN @SortCriteria IN ( 'SPID', 'session_id' ) THEN
+                       CAST(R.session_id AS VARBINARY(50))
+                   WHEN @SortCriteria IN ( 'BatchStartTime', 'start_time' ) THEN
+                       CAST(R.start_time AS VARBINARY(50))
+                   WHEN @SortCriteria IN ( 'TranStartTime', 'Tran' ) THEN
+                       CAST(ISNULL(DATEDIFF(mi, t.transaction_begin_time, GETDATE()), 0) AS VARBINARY(50))
+               END AS SortCriteria,
+               CASE
+                   WHEN @ShowPlan = 1 THEN
+                       qp.Query_plan
+                   WHEN @ShowPlan = 0 THEN
+                       'Query Plan Not Requested: @ShowPlan = 0'
+               END AS QueryPlan
+        --, qp.Query_plan
+        FROM sys.dm_exec_requests R
+            LEFT OUTER JOIN sys.dm_exec_sessions S
+                ON R.Session_id = S.Session_id
+            LEFT OUTER JOIN sys.dm_tran_active_transactions t
+                ON R.transaction_id = t.transaction_id
+            LEFT OUTER JOIN sys.dm_exec_query_memory_grants m
+                ON S.Session_id = m.session_id
+                   AND R.request_id = m.request_id
+            LEFT OUTER JOIN sys.dm_db_session_space_usage u
+                ON S.Session_id = u.session_id
+            CROSS APPLY sys.dm_exec_sql_text(R.sql_handle) AS qt
+            OUTER APPLY sys.dm_exec_query_plan(R.plan_handle) AS qp
+            CROSS APPLY sys.dm_exec_input_buffer(S.session_id, NULL) AS ib
+        WHERE (
+                  S.is_user_process = 1
+                  AND R.Session_id <> @@spid
+                  AND R.wait_type <> 'SP_SERVER_DIAGNOSTICS_SLEEP'
+              )
+              OR R.open_transaction_count > 0
+    ) AS Active
+    ORDER BY SortCriteria ASC;
+END;
 
-		Cross Apply sys.dm_exec_sql_text(R.sql_handle) As qt
-		Outer Apply sys.dm_exec_query_plan(R.plan_handle) AS qp
-		Cross Apply sys.dm_exec_input_buffer(S.session_id, NULL) AS ib  
+IF @Fast = 1
+BEGIN
+    SELECT *
+    FROM
+    (
+        SELECT R.session_id AS SPID,
+               R.start_time AS BatchStartTime,
+               DATEDIFF(ss, R.start_time, GETDATE()) / 60 AS BatchMin,
+               t.transaction_begin_time AS TranStartTime,
+               DATEDIFF(ss, t.transaction_begin_time, GETDATE()) / 60 AS TranMin,
+               S.login_name AS Login,
+               S.host_name AS Host,
+               R.Blocking_session_id AS blocker,
+               DB_NAME(R.database_id) AS dbName,
+               ib.event_info AS InputBuffer,
+               R.wait_type,
+               R.status,
+               R.command,
+               R.cpu_time,
+               R.reads,
+               R.writes,
+               R.start_time,
+               S.last_request_start_time,
+               m.scheduler_id,
+               m.requested_memory_kb,
+               m.granted_memory_kb,
+               m.query_cost,
+               CONVERT(VARCHAR(50), '(' + CONVERT(VARCHAR(5), wait_time) + 'ms)') + wait_resource AS wait_resource,
+               (R.estimated_completion_time / 1000) / 60.0 AS ect_min,
+               R.percent_complete,
+               R.open_transaction_count,
+               R.total_elapsed_time,
+               CASE
+                   WHEN @SortCriteria IN ( 'SPID', 'session_id' ) THEN
+                       CAST(R.session_id AS VARBINARY(50))
+                   WHEN @SortCriteria IN ( 'BatchStartTime', 'start_time' ) THEN
+                       CAST(R.start_time AS VARBINARY(50))
+                   WHEN @SortCriteria IN ( 'TranStartTime', 'Tran' ) THEN
+                       CAST(ISNULL(DATEDIFF(mi, t.transaction_begin_time, GETDATE()), 0) AS VARBINARY(50))
+               END AS SortCriteria
+        FROM sys.dm_exec_requests R
+            LEFT OUTER JOIN sys.dm_exec_sessions S
+                ON R.Session_id = S.Session_id
+            LEFT OUTER JOIN sys.dm_tran_active_transactions t
+                ON R.transaction_id = t.transaction_id
+            LEFT OUTER JOIN sys.dm_exec_query_memory_grants m
+                ON S.Session_id = m.session_id
+                   AND R.request_id = m.request_id
+            CROSS APPLY sys.dm_exec_input_buffer(S.session_id, NULL) AS ib
+        WHERE (
+                  S.is_user_process = 1
+                  AND R.Session_id <> @@spid
+                  AND R.wait_type <> 'SP_SERVER_DIAGNOSTICS_SLEEP'
+              )
+              OR R.open_transaction_count > 0
+    ) AS Active
+    ORDER BY SortCriteria ASC;
 
-	where (S.is_user_process = 1
-	and R.Session_id <> @@spid
-	and r.wait_type <> 'SP_SERVER_DIAGNOSTICS_SLEEP'
-	)
-	or R.open_transaction_count > 0 
-	 ) As Active
-
-	Order By SortCriteria Asc;
-end
-
-if @Fast = 1
-begin
-Select * From
-	(Select
-		R.session_id as [SPID]
-		, R.start_time as BatchStartTime
-		, datediff(ss, R.start_time, getDate())/60 as BatchMin
-		, T.transaction_begin_time as TranStartTime
-		, datediff(ss, T.transaction_begin_time, getDate())/60 as TranMin
-		, S.login_name as [Login]
-		, S.host_name as [Host]
-		, R.Blocking_session_id as blocker
-		, db_name(r.database_id) as dbName
-		, ib.event_info  as InputBuffer
-		, R.wait_type
-		, R.status
-		, R.command
-		, R.cpu_time
-		, R.reads
-		, R.writes
-		, R.start_time
-		, S.last_request_start_time
-		, m.scheduler_id
-		, m.requested_memory_kb
-		, m.granted_memory_kb
-		, m.query_cost
-		,convert(varchar(50),'('+convert(varchar(5),wait_time)+'ms)')+wait_resource as wait_resource
-		, (R.estimated_completion_time/1000)/60.0 as ect_min
-	    , R.percent_complete
-		, R.open_transaction_count
-		, R.total_elapsed_time
-		, Case
-			When @SortCriteria In ('SPID', 'session_id') Then Cast(R.session_id As VarBinary(50))
-			When @SortCriteria In ('BatchStartTime', 'start_time') Then Cast(R.start_time As VarBinary(50))
-			When @SortCriteria In ('TranStartTime', 'Tran') Then Cast(IsNull(datediff(mi, T.transaction_begin_time, getDate()),0) As VarBinary(50))
-		End As SortCriteria
-	
-	from sys.dm_exec_requests R 
-	left outer join sys.dm_exec_sessions S
-		on R.Session_id = S.Session_id
-	left outer join sys.dm_tran_active_transactions t
-	on r.transaction_id = t.transaction_id
-	left outer join sys.dm_exec_query_memory_grants m
-	on S.Session_id = m.session_id
-	and R.request_id = m.request_id
-
-	Cross Apply sys.dm_exec_input_buffer(S.session_id, NULL) AS ib  
-
-	where (S.is_user_process = 1
-	and R.Session_id <> @@spid
-	and r.wait_type <> 'SP_SERVER_DIAGNOSTICS_SLEEP'
-	)
-	or R.open_transaction_count > 0 
-	 ) As Active
-	
-	Order By SortCriteria Asc;
-
-end
+END;
 
 
 
-If @IncludeBlocking = 1
-Begin
-	With Blocking (SPID, Blocker) As
-	(
-	Select Distinct R2.Blocking_session_id As SPID, 0 As Blocker
-	From sys.dm_exec_requests R1
-	Join sys.dm_exec_requests R2 On R1.session_id = R2.Blocking_session_id
-	And R1.Blocking_session_id = 0
-	Union
-	Select session_id As SPID, Blocking_session_id As Blocker
-	From sys.dm_exec_requests R 
-	Where Blocking_session_id <> 0
-	)
-	Select * From Blocking Order By Blocker Asc
-End
+IF @IncludeBlocking = 1
+BEGIN
+    WITH Blocking (SPID, Blocker)
+    AS (SELECT DISTINCT
+               R2.Blocking_session_id AS SPID,
+               0 AS Blocker
+        FROM sys.dm_exec_requests R1
+            JOIN sys.dm_exec_requests R2
+                ON R1.session_id = R2.Blocking_session_id
+                   AND R1.Blocking_session_id = 0
+        UNION
+        SELECT session_id AS SPID,
+               Blocking_session_id AS Blocker
+        FROM sys.dm_exec_requests R
+        WHERE Blocking_session_id <> 0)
+    SELECT *
+    FROM Blocking
+    ORDER BY Blocker ASC;
+END;
 
-Return
+
+IF @IncludeSleepers = 1
+BEGIN
+    IF EXISTS
+    (
+        SELECT 1
+        FROM sys.dm_tran_active_transactions at
+            INNER JOIN sys.dm_tran_session_transactions st
+                ON st.transaction_id = at.transaction_id
+            LEFT OUTER JOIN sys.dm_exec_sessions sess
+                ON st.session_id = sess.session_id
+            LEFT OUTER JOIN sys.dm_exec_connections conn
+                ON conn.session_id = sess.session_id
+            OUTER APPLY sys.dm_exec_sql_text(conn.most_recent_sql_handle) AS txt
+        WHERE DATEDIFF(SECOND, transaction_begin_time, GETDATE()) > 60
+              AND is_user_process = 1
+    )
+        SELECT st.session_id,
+               DATEDIFF(SECOND, transaction_begin_time, GETDATE()) AS tran_elapsed_time_seconds,
+               txt.text,
+               at.transaction_id,
+               at.name,
+               at.transaction_begin_time,
+               at.transaction_type,
+               at.transaction_status,
+               sess.original_login_name,
+               sess.host_name
+        FROM sys.dm_tran_active_transactions at
+            INNER JOIN sys.dm_tran_session_transactions st
+                ON st.transaction_id = at.transaction_id
+            LEFT OUTER JOIN sys.dm_exec_sessions sess
+                ON st.session_id = sess.session_id
+            LEFT OUTER JOIN sys.dm_exec_connections conn
+                ON conn.session_id = sess.session_id
+            OUTER APPLY sys.dm_exec_sql_text(conn.most_recent_sql_handle) AS txt
+        WHERE DATEDIFF(SECOND, transaction_begin_time, GETDATE()) > 60
+              AND is_user_process = 1;
+END;
+
+
+
+RETURN;
 
 QuitWithError:
-Declare @MsgTxt VarChar(150)
-Select @MsgTxt = IsNull(@ErrMsg, 'Unspecified Error')
-RaisError(@MsgTxt, 15, 1)
-Return
-
-
-
-
-
-
-GO
-
+DECLARE @MsgTxt VARCHAR(150);
+SELECT @MsgTxt = ISNULL(@ErrMsg, 'Unspecified Error');
+RAISERROR(@MsgTxt, 15, 1);
+RETURN;
 
